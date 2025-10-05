@@ -28,6 +28,7 @@ pub static BTC_ESPLORA_CLIENT: std::sync::LazyLock<bdk_esplora::esplora_client::
 const OP_CHECKSIGFROMSTACK: u8 = 0xcc;
 static SECP: std::sync::LazyLock<bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>> =
     std::sync::LazyLock::new(bitcoin::secp256k1::Secp256k1::new);
+
 fn build_bid_accepted_script(
     bid_accepted_id: &str,
     bid_accepted_pubkey: &str,
@@ -63,7 +64,7 @@ fn nums_point() -> Result<bitcoin::XOnlyPublicKey, AuctionError> {
 mod tests {
     use std::str::FromStr;
 
-    use crate::{BTC_ESPLORA_CLIENT, SECP, nums_point};
+    use crate::BTC_ESPLORA_CLIENT;
 
     static ALICE_KEYPAIR: std::sync::LazyLock<nostro2_signer::keypair::NostrKeypair> =
         std::sync::LazyLock::new(|| {
@@ -166,6 +167,7 @@ mod tests {
             created_at: 0,
             ..Default::default()
         };
+        // serialize the Nostr id in Nostr format (last step is sha256 so we dont need to rehash it)
         bid_accepted_template
             .serialize_id()
             .expect("Failed to serialize id");
@@ -388,10 +390,11 @@ mod tests {
             ))
             .expect("failed to compute control block");
 
+        // Sign the note with Alice's key, will add the signature to the note
         ALICE_KEYPAIR
             .sign_note(&mut alice_accepted_template)
             .unwrap();
-        // 4) Build witness: [<your items> <script> <control_block>]
+        // Build witness: [<alice_signatue> <message>  <script> <control_block>]
         let mut wit = bitcoin::Witness::new();
         wit.push(
             hex::decode(alice_accepted_template.sig.as_ref().unwrap())
@@ -413,15 +416,15 @@ mod tests {
             .await
             .unwrap();
 
+        // TODO: we need to validate the outpoint is actually spendable
         let funded_utxo = address_utxos.first().unwrap().txid;
 
+        // an address to send the money to
         let to_address = ALICE_WALLET
             .write()
             .await
             .next_unused_address(bdk_wallet::KeychainKind::External);
 
-        // push scrpt buf??
-        // push control block
         let tx = bitcoin::Transaction {
             version: bitcoin::transaction::Version(2),
             lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
@@ -435,6 +438,7 @@ mod tests {
                 ..Default::default()
             }],
             output: vec![bitcoin::TxOut {
+                // TODO: spend the whole amount
                 value: bitcoin::Amount::from_sat(1000),
                 script_pubkey: to_address.script_pubkey(),
             }],
