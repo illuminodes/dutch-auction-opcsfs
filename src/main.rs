@@ -17,6 +17,26 @@ pub enum AuctionError {
     IntegerConversion(#[from] std::num::TryFromIntError),
     #[error("secp256k1 error {0}")]
     Secp256k1(#[from] bitcoin::secp256k1::Error),
+    #[error("Address error {0}")]
+    AddressParse(#[from] bitcoin::address::ParseError),
+    #[error("nostr error {0}")]
+    Nostr(#[from] nostro2::errors::NostrErrors),
+    #[error("Keypair error {0}")]
+    Keypair(#[from] nostro2_signer::errors::NostrKeypairError),
+    #[error("Taproot error {0}")]
+    Taproot(#[from] bitcoin::taproot::TaprootError),
+    #[error("Taproot builder error {0}")]
+    TaprootBuilder(#[from] bitcoin::taproot::TaprootBuilderError),
+    #[error("No ID")]
+    NoId,
+    #[error("No Pubkey")]
+    NoPubkey,
+    #[error("No Signature")]
+    NoSig,
+    #[error("No control block")]
+    NoControlBlock,
+    #[error("Finalized taproot could not be built")]
+    CouldNotBuildBidAddress,
 }
 pub static BTC_ESPLORA_CLIENT: std::sync::LazyLock<bdk_esplora::esplora_client::AsyncClient> =
     std::sync::LazyLock::new(|| {
@@ -29,40 +49,119 @@ const OP_CHECKSIGFROMSTACK: u8 = 0xcc;
 static SECP: std::sync::LazyLock<bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>> =
     std::sync::LazyLock::new(bitcoin::secp256k1::Secp256k1::new);
 
-fn build_bid_accepted_script(
-    bid_accepted_id: &str,
-    bid_accepted_pubkey: &str,
-) -> Result<bitcoin::ScriptBuf, AuctionError> {
-    let bid_accepted_id = hex::decode(bid_accepted_id)?;
-    let bid_accepted_pubkey = hex::decode(bid_accepted_pubkey)?;
-    let mut script_bytes = Vec::new();
-    // push outcome message hash len + bytes(32 bytes)
-    script_bytes.push(bid_accepted_id.len().try_into()?);
-    script_bytes.extend_from_slice(bid_accepted_id.as_slice());
-
-    // push oracle pubkey len + bytes (32 bytes)
-    script_bytes.push(bid_accepted_pubkey.len().try_into()?);
-    script_bytes.extend_from_slice(bid_accepted_pubkey.as_slice());
-
-    // push OP_CHECKSIGFROMSTACK
-    script_bytes.push(OP_CHECKSIGFROMSTACK);
-
-    Ok(bitcoin::ScriptBuf::from_bytes(script_bytes))
+/// The bidding address is a Taproot address with a control block for each participant.
+/// Every participant can claim the funds by providing a valid signed Nostr note as proof of authorization.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BiddingAddress {
+    network: bitcoin::Network,
+    address: String,
+    control_blocks: Vec<(String, bitcoin::taproot::ControlBlock)>,
 }
 
-fn nums_point() -> Result<bitcoin::XOnlyPublicKey, AuctionError> {
-    let nums_bytes = [
-        0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a,
-        0x5e, 0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80,
-        0x3a, 0xc0,
-    ];
+impl BiddingAddress {
+    pub fn new(network: bitcoin::Network, participants: &[&str]) -> Result<Self, AuctionError> {
+        let mut bid_address = bitcoin::taproot::TaprootBuilder::new();
+        for pubkey in participants {
+            let template = AcceptTemplate::new(pubkey)?;
+            let script = template.accept_script()?;
+            bid_address = bid_address.add_leaf(1, script)?;
+        }
+        let Ok(bid_address) = bid_address.finalize(&SECP, Self::nums_point()?) else {
+            return Err(AuctionError::CouldNotBuildBidAddress);
+        };
+        let mut control_blocks = Vec::new();
+        for pubkey in participants {
+            let template = AcceptTemplate::new(pubkey)?;
+            let script = template.accept_script()?;
+            let control_block = bid_address
+                .control_block(&(script.clone(), bitcoin::taproot::LeafVersion::TapScript))
+                .ok_or(AuctionError::NoControlBlock)?;
+            control_blocks.push((template.0.pubkey, control_block));
+        }
 
-    Ok(bitcoin::XOnlyPublicKey::from_slice(&nums_bytes)?)
+        let address = bitcoin::Address::p2tr_tweaked(bid_address.output_key(), network);
+        Ok(Self {
+            network,
+            address: address.to_string(),
+            control_blocks,
+        })
+    }
+    pub fn checked_address(&self) -> Result<bitcoin::Address, AuctionError> {
+        use std::str::FromStr;
+        Ok(bitcoin::Address::from_str(&self.address)
+            .and_then(|a| a.require_network(self.network))?)
+    }
+
+    fn nums_point() -> Result<bitcoin::XOnlyPublicKey, AuctionError> {
+        let nums_bytes = [
+            0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9,
+            0x7a, 0x5e, 0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a,
+            0xce, 0x80, 0x3a, 0xc0,
+        ];
+
+        Ok(bitcoin::XOnlyPublicKey::from_slice(&nums_bytes)?)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptTemplate(nostro2::NostrNote);
+
+impl AcceptTemplate {
+    pub fn new(pubkey: &str) -> Result<Self, AuctionError> {
+        let mut note = nostro2::NostrNote {
+            content: "Give me my money".to_string(),
+            kind: 666,
+            pubkey: pubkey.to_string(),
+            created_at: 666,
+            ..Default::default()
+        };
+        note.serialize_id()?;
+        assert_eq!(note.id.as_ref().map(|s| s.len()), Some(64));
+        Ok(Self(note))
+    }
+    pub fn sign(
+        &mut self,
+        nostr_keypair: &nostro2_signer::keypair::NostrKeypair,
+    ) -> Result<(), AuctionError> {
+        nostr_keypair.sign_note(&mut self.0)?;
+        Ok(())
+    }
+    pub fn accept_script(&self) -> Result<bitcoin::ScriptBuf, AuctionError> {
+        let bid_accepted_id = hex::decode(self.0.id.as_ref().ok_or(AuctionError::NoId)?)?;
+        if self.0.pubkey.is_empty() {
+            return Err(AuctionError::NoPubkey);
+        }
+        let bid_accepted_pubkey = hex::decode(&self.0.pubkey)?;
+        let mut script_bytes = Vec::new();
+        // push outcome message hash len + bytes(32 bytes)
+        script_bytes.push(bid_accepted_id.len().try_into()?);
+        script_bytes.extend_from_slice(bid_accepted_id.as_slice());
+
+        // push oracle pubkey len + bytes (32 bytes)
+        script_bytes.push(bid_accepted_pubkey.len().try_into()?);
+        script_bytes.extend_from_slice(bid_accepted_pubkey.as_slice());
+
+        // push OP_CHECKSIGFROMSTACK
+        script_bytes.push(OP_CHECKSIGFROMSTACK);
+
+        Ok(bitcoin::ScriptBuf::from_bytes(script_bytes))
+    }
+    pub fn witness(
+        &self,
+        control_block: &bitcoin::taproot::ControlBlock,
+    ) -> Result<bitcoin::Witness, AuctionError> {
+        let mut wit = bitcoin::Witness::new();
+        wit.push(hex::decode(self.0.sig.as_ref().ok_or(AuctionError::NoSig)?)?.as_slice());
+        wit.push(hex::decode(self.0.id.as_ref().ok_or(AuctionError::NoId)?)?.as_slice());
+        wit.push(self.accept_script()?.to_bytes());
+        wit.push(control_block.serialize());
+
+        Ok(wit)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
 
     use crate::BTC_ESPLORA_CLIENT;
 
@@ -157,51 +256,18 @@ mod tests {
 
     #[test]
     fn create_outcome_scripts_for_alice() {
-        let mut bid_accepted_template = nostro2::NostrNote {
-            content: "bid accepted".to_string(),
-            kind: 1,
-            pubkey: ALICE_KEYPAIR.public_key().to_string(),
-            // we need to keep a stable timestamp so the id doesnt change
-            // could be the timestamp of the auction expiry or the bid creation time
-            // for now we use 0 for simplicity
-            created_at: 0,
-            ..Default::default()
-        };
-        // serialize the Nostr id in Nostr format (last step is sha256 so we dont need to rehash it)
-        bid_accepted_template
-            .serialize_id()
-            .expect("Failed to serialize id");
-        assert_eq!(bid_accepted_template.id.as_ref().map(|s| s.len()), Some(64));
-        let mut bid_accepted_template_reconstructed = nostro2::NostrNote {
-            content: "bid accepted".to_string(),
-            kind: 1,
-            pubkey: ALICE_KEYPAIR.public_key().to_string(),
-            // we need to keep a stable timestamp so the id doesnt change
-            // could be the timestamp of the auction expiry or the bid creation time
-            // for now we use 0 for simplicity
-            created_at: 0,
-            ..Default::default()
-        };
-        bid_accepted_template_reconstructed
-            .serialize_id()
-            .expect("Failed to serialize id");
-        assert_eq!(
-            bid_accepted_template_reconstructed
-                .id
-                .as_ref()
-                .map(|s| s.len()),
-            Some(64)
-        );
+        let bid_accepted_template =
+            super::AcceptTemplate::new(&ALICE_KEYPAIR.public_key().to_string())
+                .expect("Failed to create accept template");
+        let bid_accepted_template_reconstructed =
+            super::AcceptTemplate::new(&ALICE_KEYPAIR.public_key().to_string())
+                .expect("Failed to create accept template");
         // ensure you can reconstruct the id from the agreed content
-        assert_eq!(
-            bid_accepted_template.id,
-            bid_accepted_template_reconstructed.id
-        );
+        assert_eq!(bid_accepted_template, bid_accepted_template_reconstructed);
         // a Nostr ID is already a sha256, so we dont need to rehash it
-        let id = bid_accepted_template.id.expect("Failed to serialize id");
-        println!("bid accepted id: {}", id);
 
-        let script_buf = super::build_bid_accepted_script(&id, &bid_accepted_template.pubkey)
+        let script_buf = bid_accepted_template
+            .accept_script()
             .expect("Failed to build bid accepted script");
         let script_bytes = script_buf.to_bytes();
 
@@ -217,65 +283,18 @@ mod tests {
     #[test]
     fn build_bid_address_script() {
         // First we create a bid accepted note for both Alice and Bob
-        let mut alice_accepted_template = nostro2::NostrNote {
-            content: "bid accepted".to_string(),
-            kind: 1,
-            pubkey: ALICE_KEYPAIR.public_key().to_string(),
-            created_at: 0,
-            ..Default::default()
-        };
-        alice_accepted_template
-            .serialize_id()
-            .expect("Failed to serialize id");
-        assert_eq!(
-            alice_accepted_template.id.as_ref().map(|s| s.len()),
-            Some(64)
-        );
-        let mut bob_accepted_template = nostro2::NostrNote {
-            content: "bid accepted".to_string(),
-            kind: 1,
-            pubkey: BOB_KEYPAIR.public_key().to_string(),
-            created_at: 0,
-            ..Default::default()
-        };
-        bob_accepted_template
-            .serialize_id()
-            .expect("Failed to serialize id");
-        assert_eq!(bob_accepted_template.id.as_ref().map(|s| s.len()), Some(64));
-        // and now we can build the scripts for both
-        let alice_script = super::build_bid_accepted_script(
-            &alice_accepted_template.id.expect("Failed to serialize id"),
-            &alice_accepted_template.pubkey,
+        let bid_address = super::BiddingAddress::new(
+            bitcoin::Network::Signet,
+            &[
+                &ALICE_KEYPAIR.public_key().to_string(),
+                &BOB_KEYPAIR.public_key().to_string(),
+            ],
         )
-        .expect("Failed to build bid accepted script");
-        let bob_script = super::build_bid_accepted_script(
-            &bob_accepted_template.id.expect("Failed to serialize id"),
-            &bob_accepted_template.pubkey,
-        )
-        .expect("Failed to build bid accepted script");
-        println!("alice script: {alice_script}");
-        println!("bob script: {bob_script}");
-
-        // we are creating a taproot address with two spend paths
-        //
-        // Path 0: CSFS verification for alice
-        // Path 1: CSFS verification for bob
-        let nums_point = super::nums_point().expect("Failed to get nums point");
-        println!("nums point: {nums_point}");
-        let bid_address = bitcoin::taproot::TaprootBuilder::new()
-            .add_leaf(1, alice_script)
-            .expect("Failed to add leaf")
-            .add_leaf(1, bob_script)
-            .expect("Failed to add leaf")
-            .finalize(&super::SECP, nums_point)
-            .expect("Failed to finalize taproot");
-        let address =
-            bitcoin::Address::p2tr_tweaked(bid_address.output_key(), bitcoin::Network::Signet);
+        .expect("Failed to create bid address");
+        let address = bid_address.address;
         println!("bid address: {address}");
-        assert_eq!(
-            address.to_string(),
-            "tb1pd790gwtaajsd5wzy3jc6dlw4yf97mrpaz77mjnumm0fequexj3fq0jnpv5"
-        );
+        assert!(address.to_string().starts_with("tb1"));
+        assert_eq!(bid_address.control_blocks.len(), 2);
     }
     #[tokio::test]
     async fn alice_can_check_her_wallet() {
@@ -300,16 +319,17 @@ mod tests {
     }
     #[tokio::test]
     async fn bid_address_is_funded() {
-        let address = bitcoin::Address::from_str(
-            "tb1pd790gwtaajsd5wzy3jc6dlw4yf97mrpaz77mjnumm0fequexj3fq0jnpv5",
+        let address = super::BiddingAddress::new(
+            bitcoin::Network::Signet,
+            &[
+                &ALICE_KEYPAIR.public_key().to_string(),
+                &BOB_KEYPAIR.public_key().to_string(),
+            ],
         )
-        .unwrap();
-        let checked_address = address
-            .require_network(bitcoin::Network::Signet)
-            .expect("valid address");
+        .expect("Failed to create bid address");
 
         let txs = super::BTC_ESPLORA_CLIENT
-            .get_address_stats(&checked_address)
+            .get_address_stats(&address.checked_address().expect("Failed to parse address"))
             .await
             .unwrap();
         println!("txs: {txs:?}");
@@ -318,106 +338,75 @@ mod tests {
     }
     #[tokio::test]
     async fn alice_can_spend_bid() {
-        let mut alice_accepted_template = nostro2::NostrNote {
-            content: "bid accepted".to_string(),
-            kind: 1,
-            pubkey: ALICE_KEYPAIR.public_key().to_string(),
-            created_at: 0,
-            ..Default::default()
-        };
-        alice_accepted_template
-            .serialize_id()
-            .expect("Failed to serialize id");
-        assert_eq!(
-            alice_accepted_template.id.as_ref().map(|s| s.len()),
-            Some(64)
-        );
-        let mut bob_accepted_template = nostro2::NostrNote {
-            content: "bid accepted".to_string(),
-            kind: 1,
-            pubkey: BOB_KEYPAIR.public_key().to_string(),
-            created_at: 0,
-            ..Default::default()
-        };
-        bob_accepted_template
-            .serialize_id()
-            .expect("Failed to serialize id");
-        assert_eq!(bob_accepted_template.id.as_ref().map(|s| s.len()), Some(64));
-        // and now we can build the scripts for both
-        let alice_script = super::build_bid_accepted_script(
-            alice_accepted_template
-                .id
-                .as_ref()
-                .expect("Failed to serialize id"),
-            &alice_accepted_template.pubkey,
+        let bid_address = super::BiddingAddress::new(
+            bitcoin::Network::Signet,
+            &[
+                &ALICE_KEYPAIR.public_key().to_string(),
+                &BOB_KEYPAIR.public_key().to_string(),
+            ],
         )
-        .expect("Failed to build bid accepted script");
-        let bob_script = super::build_bid_accepted_script(
-            &bob_accepted_template.id.expect("Failed to serialize id"),
-            &bob_accepted_template.pubkey,
-        )
-        .expect("Failed to build bid accepted script");
-        println!("alice script: {alice_script}");
-        println!("bob script: {bob_script}");
-
-        // we are creating a taproot address with two spend paths
-        //
-        // Path 0: CSFS verification for alice
-        // Path 1: CSFS verification for bob
-        let nums_point = super::nums_point().expect("Failed to get nums point");
-        println!("nums point: {nums_point}");
-        let bid_address = bitcoin::taproot::TaprootBuilder::new()
-            .add_leaf(1, alice_script.clone())
-            .expect("Failed to add leaf")
-            .add_leaf(1, bob_script)
-            .expect("Failed to add leaf")
-            .finalize(&super::SECP, nums_point)
-            .expect("Failed to finalize taproot");
-
-        let tapleaf = bitcoin::TapLeafHash::from_script(
-            alice_script.as_script(),
-            bitcoin::taproot::LeafVersion::TapScript,
-        );
-
-        println!("alice_script: {alice_script}");
-        println!("tapleaf: {tapleaf}");
+        .expect("Failed to create bid address");
 
         // 3) Compute the control block for this exact leaf.
         let ctrl = bid_address
-            .control_block(&(
-                alice_script.clone(),
-                bitcoin::taproot::LeafVersion::TapScript,
-            ))
-            .expect("failed to compute control block");
+            .control_blocks
+            .iter()
+            .find_map(|(pubkey, blk)| (pubkey == &ALICE_KEYPAIR.public_key()).then_some(blk))
+            .expect("failed to find control block");
+        println!("control block: {ctrl:?}");
 
         // Sign the note with Alice's key, will add the signature to the note
-        ALICE_KEYPAIR
-            .sign_note(&mut alice_accepted_template)
-            .unwrap();
+        let mut alice_accepted_template =
+            super::AcceptTemplate::new(&ALICE_KEYPAIR.public_key().to_string())
+                .expect("Failed to create accept template");
+        alice_accepted_template
+            .sign(&ALICE_KEYPAIR)
+            .expect("Failed to sign accept template");
         // Build witness: [<alice_signatue> <message>  <script> <control_block>]
-        let mut wit = bitcoin::Witness::new();
-        wit.push(
-            hex::decode(alice_accepted_template.sig.as_ref().unwrap())
-                .unwrap()
-                .as_slice(),
-        );
-        wit.push(
-            hex::decode(alice_accepted_template.id.as_ref().unwrap())
-                .unwrap()
-                .as_slice(),
-        );
-        wit.push(alice_script.as_bytes());
-        wit.push(ctrl.serialize());
+        let wit = alice_accepted_template
+            .witness(ctrl)
+            .expect("Failed to build witness");
 
-        let address =
-            bitcoin::Address::p2tr_tweaked(bid_address.output_key(), bitcoin::Network::Signet);
+        // print the address
+        println!("bid address: {}", bid_address.address);
         let address_utxos = BTC_ESPLORA_CLIENT
-            .get_address_txs(&address, None)
+            .get_address_txs(
+                &bid_address
+                    .checked_address()
+                    .expect("Failed to parse address"),
+                None,
+            )
             .await
             .unwrap();
 
-        // TODO: we need to validate the outpoint is actually spendable
-        let funded_utxo = address_utxos.first().unwrap().txid;
+        let mut all_outputs = Vec::new();
+        for tx in &address_utxos {
+            for (vout_index, vout) in tx.vout.iter().enumerate() {
+                if vout.scriptpubkey
+                    == bid_address
+                        .checked_address()
+                        .expect("Failed to parse address")
+                        .script_pubkey()
+                {
+                    all_outputs.push((tx.txid, vout_index as u32, vout.value));
+                }
+            }
+        }
+        let mut spent_outpoints = std::collections::HashSet::new();
+        for tx in &address_utxos {
+            for vin in &tx.vin {
+                spent_outpoints.insert((vin.txid, vin.vout));
+            }
+        }
+
+        let Some(spendable_utxo) = all_outputs.into_iter().find_map(|(txid, vout_index, _)| {
+            (!spent_outpoints.contains(&(txid, vout_index))).then_some(bitcoin::OutPoint {
+                txid,
+                vout: vout_index,
+            })
+        }) else {
+            panic!("No spendable UTXO found");
+        };
 
         // an address to send the money to
         let to_address = ALICE_WALLET
@@ -430,10 +419,7 @@ mod tests {
             lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
             input: vec![bitcoin::TxIn {
                 sequence: bitcoin::blockdata::transaction::Sequence::ENABLE_RBF_NO_LOCKTIME,
-                previous_output: bitcoin::OutPoint {
-                    txid: funded_utxo,
-                    vout: 1,
-                },
+                previous_output: spendable_utxo,
                 witness: wit,
                 ..Default::default()
             }],
@@ -443,6 +429,11 @@ mod tests {
                 script_pubkey: to_address.script_pubkey(),
             }],
         };
+        println!("Broadcasting transaction...");
+        use bitcoin::consensus::encode;
+
+        let tx_hex = encode::serialize_hex(&tx);
+        println!("{:?}", tx_hex);
         BTC_ESPLORA_CLIENT.broadcast(&tx).await.unwrap();
     }
 }
